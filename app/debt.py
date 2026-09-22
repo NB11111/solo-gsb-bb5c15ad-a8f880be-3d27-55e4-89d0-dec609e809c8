@@ -42,7 +42,20 @@ class _BucketState:
         self.last_time = last_time
 
 
-def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
+def replay_debt(payload: DebtSimulateRequest) -> dict:
+    """按补充先偿债、限额内借债规则完整回放一次请求序列。
+
+    返回原始（未取整）内部数据，供 /debt-simulate 与 /debt-diff 复用：
+
+    - ``results_by_index``：按**原始输入索引**排列的逐项结果
+      （DebtSimResult，数值已取整，与 /debt-simulate 完全一致）；
+    - ``snapshots_by_index``：每个原始索引在该请求时刻（链上桶判定之后）
+      **全部桶**的 (balance, debt) 原始快照——所有桶（含未被该请求链
+      触及的桶）都已先连续补充/偿债到该时刻；
+    - ``final_states``：按 buckets 输入顺序的终态原始数据
+      ``(id, capacity, refill_rate, debt_limit, balance, debt)``，
+      观察时刻为最后一个请求的时间戳。
+    """
     buckets = payload.buckets
     requests = payload.requests
 
@@ -84,6 +97,7 @@ def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
     order = sorted(range(len(requests)), key=lambda i: (requests[i].timestamp, i))
 
     results_by_index: dict[int, DebtSimResult] = {}
+    snapshots_by_index: dict[int, dict[str, tuple[float, float]]] = {}
 
     for i in order:
         request = requests[i]
@@ -166,24 +180,56 @@ def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
             rejection=rejection,
         )
 
-    results = [results_by_index[i] for i in range(len(requests))]
+        # /debt-diff 需要按桶对齐两组回放：把链外桶也推进到当前时刻，
+        # 记录该请求时刻全部桶的余额/债务原始快照（仅用于差异比较）。
+        snapshot: dict[str, tuple[float, float]] = {}
+        for bucket_id in bucket_ids:
+            state = advance(bucket_id, now)
+            snapshot[bucket_id] = (state.balance, state.debt)
+        snapshots_by_index[i] = snapshot
+
+    # 循环结束时每个桶都在上一个处理请求中被推进过；再统一推进到
+    # 最后时刻（链外桶在循环中已逐刻推进，此处通常无增量），给出终态。
+    final_states: list[tuple[str, float, float, float, float, float]] = []
+    for bucket_id in bucket_ids:
+        state = advance(bucket_id, t_end)
+        final_states.append(
+            (
+                bucket_id,
+                capacity[bucket_id],
+                refill_rate[bucket_id],
+                debt_limit[bucket_id],
+                state.balance,
+                state.debt,
+            )
+        )
+
+    return {
+        "results_by_index": results_by_index,
+        "snapshots_by_index": snapshots_by_index,
+        "final_states": final_states,
+    }
+
+
+def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
+    replayed = replay_debt(payload)
+    results_by_index = replayed["results_by_index"]
+
+    results = [results_by_index[i] for i in range(len(payload.requests))]
     allowed_count = sum(1 for r in results if r.allowed)
 
     # 把所有未再参与请求的桶补充到最后时刻，给出终态快照
     final_buckets: list[DebtBucketFinalState] = []
-    for bucket_id in bucket_ids:
-        state = advance(bucket_id, t_end)
+    for bucket_id, cap, rate, dlimit, balance, debt in replayed["final_states"]:
         final_buckets.append(
             DebtBucketFinalState(
                 id=bucket_id,
-                capacity=_round(capacity[bucket_id]),
-                refill_rate=_round(refill_rate[bucket_id]),
-                debt_limit=_round(debt_limit[bucket_id]),
-                balance=_round(state.balance),
-                debt=_round(state.debt),
-                available=_round(
-                    state.balance + (debt_limit[bucket_id] - state.debt)
-                ),
+                capacity=_round(cap),
+                refill_rate=_round(rate),
+                debt_limit=_round(dlimit),
+                balance=_round(balance),
+                debt=_round(debt),
+                available=_round(balance + (dlimit - debt)),
             )
         )
 

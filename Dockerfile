@@ -15,6 +15,9 @@ COPY app ./app
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 
+# 构建期冒烟校验：确保所有路由模块（含 /debt-diff）可正常导入
+RUN python -c "from app.main import app; assert any(getattr(r, 'path', None) == '/debt-diff' for r in app.routes)"
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \

@@ -3,6 +3,7 @@ services:
     build: .
     image: quota-simulator:latest
     container_name: quota-simulator
+    init: true
     ports:
       - "8000:8000"
     restart: unless-stopped
