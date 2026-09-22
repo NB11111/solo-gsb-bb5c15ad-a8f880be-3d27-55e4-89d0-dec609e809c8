@@ -8,9 +8,12 @@ from fastapi.responses import JSONResponse
 
 from app.errors import RequestValidationErrors
 from app.debt import debt_simulate
+from app.debt_diff import debt_diff
 from app.fairness import fairness_report
 from app.forecast import forecast
 from app.models import (
+    DebtDiffRequest,
+    DebtDiffResponse,
     DebtSimulateRequest,
     DebtSimulateResponse,
     FairnessReportRequest,
@@ -77,6 +80,11 @@ app = FastAPI(
         "可用余额）；cost > capacity + debt_limit 的请求永远不可达；链上任一桶"
         "无法在借贷上限内满足成本则整笔原子拒绝；响应按原始索引返回 allowed、"
         "每桶 before/after 的 balance 与 debt、rejected_by/reason 及终态快照。"
+        "以及 /debt-diff：提交 baseline 与 candidate 两组同构的可借贷桶情景"
+        "（请求数量、逐索引请求 ID 与时间戳、桶集合必须一致，否则 422），"
+        "服务分别回放后按原始请求索引对齐，返回首个 allowed/拒绝原因分歧、"
+        "各桶逐步余额/债务差值（candidate - baseline）与终态快照差值；"
+        "纯计算接口，不写入任何状态。"
     ),
     version="1.0.0",
 )
@@ -110,6 +118,7 @@ def root():
         "window_simulate": "/window-simulate",
         "rollover_simulate": "/rollover-simulate",
         "debt_simulate": "/debt-simulate",
+        "debt_diff": "/debt-diff",
     }
 
 
@@ -197,3 +206,12 @@ def rollover_simulate_endpoint(payload: RolloverSimulateRequest) -> RolloverSimu
 )
 def debt_simulate_endpoint(payload: DebtSimulateRequest) -> DebtSimulateResponse:
     return debt_simulate(payload)
+
+
+@app.post(
+    "/debt-diff",
+    response_model=DebtDiffResponse,
+    tags=["debt"],
+)
+def debt_diff_endpoint(payload: DebtDiffRequest) -> DebtDiffResponse:
+    return debt_diff(payload)

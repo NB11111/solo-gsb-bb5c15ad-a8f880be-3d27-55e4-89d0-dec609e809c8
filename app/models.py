@@ -1714,3 +1714,276 @@ class DebtSimulateResponse(BaseModel):
         list[DebtBucketFinalState],
         Field(description="各桶在最后请求时刻的终态快照，按 buckets 输入顺序"),
     ]
+
+
+# ---------- 可借贷桶情景差异试算 (/debt-diff) ----------
+
+
+class DebtDiffScenario(BaseModel):
+    """情景差异试算中的单边输入（baseline / candidate），格式与 /debt-simulate 相同。
+
+    本模型**不**自带跨字段校验器：嵌套在 DebtDiffRequest 中时由父模型的
+    校验器统一收集错误（保留 baseline./candidate. 定位前缀），避免
+    Pydantic 把嵌套校验器抛出的异常提升到父级根节点。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    buckets: Annotated[list[DebtBucketSpec], Field(min_length=1, description="可借贷令牌桶集合")]
+    requests: Annotated[
+        list[SimRequest], Field(min_length=1, description="按时间戳模拟的请求序列（可乱序输入）")
+    ]
+
+
+class DebtDiffRequest(BaseModel):
+    """POST /debt-diff 请求体：baseline 与 candidate 两组同构的可借贷桶情景。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    baseline: Annotated[DebtDiffScenario, Field(description="基线情景（差值以 candidate - baseline 计算）")]
+    candidate: Annotated[DebtDiffScenario, Field(description="候选情景")]
+
+    @model_validator(mode="after")
+    def _cross_validate(self):
+        errors: list[dict] = []
+        baseline = self.baseline
+        candidate = self.candidate
+
+        # 结构性对齐校验先于引用解析：桶集合不一致时，单边的未知引用
+        # 多半只是缺桶的连锁噪声，应优先报告对齐错误本身。
+        # 先检查各情景内部是否存在重复桶定义（这会让集合比较失去意义）。
+        set_differs = False
+        for side_name, scenario in (
+            ("baseline", baseline),
+            ("candidate", candidate),
+        ):
+            seen: set[str] = set()
+            for b_index, bucket in enumerate(scenario.buckets):
+                if bucket.id in seen:
+                    errors.append(
+                        {
+                            "type": "duplicate_bucket",
+                            "loc": (side_name, "buckets", b_index, "id"),
+                            "msg": f"重复的桶 ID: {bucket.id}",
+                            "input": bucket.id,
+                        }
+                    )
+                seen.add(bucket.id)
+        if errors:
+            raise RequestValidationErrors(errors)
+
+        # 请求数量必须一致，否则无法按原始索引对齐
+        if len(baseline.requests) != len(candidate.requests):
+            errors.append(
+                {
+                    "type": "debt_diff_request_count_mismatch",
+                    "loc": ("candidate", "requests"),
+                    "msg": (
+                        "baseline 与 candidate 的请求数量不一致："
+                        f"{len(baseline.requests)} != {len(candidate.requests)}"
+                    ),
+                    "input": {
+                        "baseline_count": len(baseline.requests),
+                        "candidate_count": len(candidate.requests),
+                    },
+                }
+            )
+            raise RequestValidationErrors(errors)
+
+        # 按原始索引逐对检查请求 ID 与时间戳（不依赖内部时间排序）
+        for i, (req_b, req_c) in enumerate(
+            zip(baseline.requests, candidate.requests)
+        ):
+            if req_b.id != req_c.id:
+                errors.append(
+                    {
+                        "type": "debt_diff_request_id_mismatch",
+                        "loc": ("candidate", "requests", i, "id"),
+                        "msg": (
+                            f"请求索引 {i} 的 ID 不一致："
+                            f"baseline={req_b.id!r}，candidate={req_c.id!r}"
+                        ),
+                        "input": {
+                            "index": i,
+                            "baseline_id": req_b.id,
+                            "candidate_id": req_c.id,
+                        },
+                    }
+                )
+            if abs(float(req_b.timestamp) - float(req_c.timestamp)) > EPS:
+                errors.append(
+                    {
+                        "type": "debt_diff_timestamp_mismatch",
+                        "loc": ("candidate", "requests", i, "timestamp"),
+                        "msg": (
+                            f"请求 {req_b.id!r}（索引 {i}）的时间戳不一致："
+                            f"baseline={float(req_b.timestamp)}，"
+                            f"candidate={float(req_c.timestamp)}"
+                        ),
+                        "input": {
+                            "index": i,
+                            "request_id": req_b.id,
+                            "baseline_timestamp": float(req_b.timestamp),
+                            "candidate_timestamp": float(req_c.timestamp),
+                        },
+                    }
+                )
+
+        # 桶集合必须同构（ID 与顺序一致），桶参数（capacity/refill_rate/
+        # initial/debt_limit）允许不同——参数差异正是候选情景的比较内容。
+        bucket_ids_b = [b.id for b in baseline.buckets]
+        bucket_ids_c = [b.id for b in candidate.buckets]
+        if bucket_ids_b != bucket_ids_c:
+            set_differs = True
+            errors.append(
+                {
+                    "type": "debt_diff_bucket_mismatch",
+                    "loc": ("candidate", "buckets"),
+                    "msg": (
+                        "baseline 与 candidate 的桶集合（ID 及顺序）不一致："
+                        f"{bucket_ids_b} != {bucket_ids_c}"
+                    ),
+                    "input": {
+                        "baseline_bucket_ids": bucket_ids_b,
+                        "candidate_bucket_ids": bucket_ids_c,
+                    },
+                }
+            )
+
+        if set_differs:
+            # 桶集合不同构时，链引用的未知桶多为缺桶的连锁结果，不再追加
+            raise RequestValidationErrors(errors)
+
+        # 桶集合同构：对两个情景各自执行与 /debt-simulate 相同的跨字段
+        # 校验（未知引用、重复请求 ID 等），错误 loc 带情景前缀以便定位。
+        for side_name in ("baseline", "candidate"):
+            scenario = getattr(self, side_name)
+            for error in _simulate_cross_validation_errors(
+                scenario.buckets, scenario.requests
+            ):
+                errors.append({**error, "loc": (side_name, *error["loc"])})
+
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class DebtDiffVerdict(BaseModel):
+    """单边情景对单个请求的放行结论。"""
+
+    allowed: Annotated[bool, Field(description="该情景下此请求是否放行")]
+    rejected_by: Annotated[
+        str | None, Field(description="该情景下导致拒绝的第一个桶 ID；放行时为 null")
+    ] = None
+    reason: Annotated[
+        str | None,
+        Field(
+            description=(
+                "该情景下的拒绝原因（cost_exceeds_limit / "
+                "debt_limit_exceeded）；放行时为 null"
+            )
+        ),
+    ] = None
+
+
+class DebtDiffBucketAfter(BaseModel):
+    """单边情景在某次请求处理之后单个桶的余额/债务。"""
+
+    balance: Annotated[float, Field(description="该请求处理之后的可用余额（被拒绝时保持判定前状态）")]
+    debt: Annotated[float, Field(description="该请求处理之后的累计债务（被拒绝时保持判定前状态）")]
+    available: Annotated[
+        float, Field(description="该请求处理之后可立即支付总额 = balance + (debt_limit - debt)")
+    ]
+
+
+class DebtDiffSideStep(BaseModel):
+    """单个请求在某一情景下的结论与全部桶的处理后快照。"""
+
+    verdict: Annotated[DebtDiffVerdict, Field(description="该情景下的放行/拒绝结论")]
+    rejected_by: Annotated[
+        str | None, Field(description="= verdict.rejected_by（便于直接读取）")
+    ] = None
+    reason: Annotated[str | None, Field(description="= verdict.reason（便于直接读取）")] = None
+    buckets: Annotated[
+        dict[str, DebtDiffBucketAfter],
+        Field(description="该请求处理之后全部桶的余额/债务/可支付总额，按桶 ID"),
+    ]
+
+
+class DebtDiffBucketDelta(BaseModel):
+    """候选相对基线在单个桶上的差值（candidate - baseline）。"""
+
+    balance_delta: Annotated[float, Field(description="可用余额差值 = candidate - baseline")]
+    debt_delta: Annotated[float, Field(description="累计债务差值 = candidate - baseline")]
+    available_delta: Annotated[
+        float, Field(description="可立即支付总额差值 = candidate - baseline")
+    ]
+
+
+class DebtDiffStep(BaseModel):
+    """按原始索引对齐后的单请求逐项对比。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: float
+    cost_baseline: Annotated[float, Field(description="基线情景中该请求的 cost")]
+    cost_candidate: Annotated[float, Field(description="候选情景中该请求的 cost")]
+    diverged: Annotated[
+        bool,
+        Field(
+            description=(
+                "allowed/rejected_by/reason 是否存在分歧；两侧均拒绝但"
+                "rejected_by 或原因不同同样为 true"
+            )
+        ),
+    ]
+    baseline: Annotated[DebtDiffSideStep, Field(description="基线情景回放结论与桶快照")]
+    candidate: Annotated[DebtDiffSideStep, Field(description="候选情景回放结论与桶快照")]
+    bucket_deltas: Annotated[
+        dict[str, DebtDiffBucketDelta],
+        Field(description="该请求处理之后各桶 candidate - baseline 的余额/债务差值"),
+    ]
+
+
+class DebtDiffFirstDivergence(BaseModel):
+    """首个 allowed/拒绝原因分歧的定位与两侧结论。"""
+
+    request_id: Annotated[str, Field(description="首个分歧请求的 ID")]
+    index: Annotated[int, Field(description="首个分歧请求在原始 requests 数组中的下标")]
+    timestamp: Annotated[float, Field(description="首个分歧请求的时间戳")]
+    baseline: Annotated[DebtDiffVerdict, Field(description="基线情景下该请求的结论")]
+    candidate: Annotated[DebtDiffVerdict, Field(description="候选情景下该请求的结论")]
+
+
+class DebtDiffFinalBucket(BaseModel):
+    """单个桶在两个情景终态（最后请求时刻）的快照与差值。"""
+
+    id: str
+    baseline: Annotated[
+        DebtBucketFinalState, Field(description="基线情景终态快照（余额/债务/可支付总额）")
+    ]
+    candidate: Annotated[
+        DebtBucketFinalState, Field(description="候选情景终态快照（余额/债务/可支付总额）")
+    ]
+    delta: Annotated[
+        DebtDiffBucketDelta, Field(description="终态 candidate - baseline 的余额/债务差值")
+    ]
+
+
+class DebtDiffResponse(BaseModel):
+    request_count: Annotated[int, Field(description="对齐后的请求数量（两情景相等）")]
+    divergence_count: Annotated[
+        int, Field(description="存在 allowed/拒绝原因分歧的请求数量")
+    ]
+    first_divergence: Annotated[
+        DebtDiffFirstDivergence | None,
+        Field(description="按原始索引首个分歧；两侧结论完全一致时为 null"),
+    ]
+    results: Annotated[
+        list[DebtDiffStep],
+        Field(description="逐请求对比，按原始输入索引升序（含各桶逐步差值）"),
+    ]
+    final_buckets: Annotated[
+        list[DebtDiffFinalBucket],
+        Field(description="各桶在最后请求时刻的双情景终态快照与差值，按桶输入顺序"),
+    ]

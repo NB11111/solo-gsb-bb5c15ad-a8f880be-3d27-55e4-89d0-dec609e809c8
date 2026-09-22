@@ -10,8 +10,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制应用代码与启动脚本（依赖与初始化全部在镜像内完成）
+# 复制应用代码、示例请求与启动脚本（依赖与初始化全部在镜像内完成）
 COPY app ./app
+COPY examples ./examples
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 

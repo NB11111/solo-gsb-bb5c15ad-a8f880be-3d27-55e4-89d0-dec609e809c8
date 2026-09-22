@@ -13,9 +13,16 @@
 - 其余当前无法在借贷上限内满足的情形以 debt_limit_exceeded 拒绝；
 - 仅当链上每个桶都能在其借贷上限内满足 cost 时才原子扣减，否则链上
   所有桶保持不变（连续补充与债务偿还作为时间推进照常发生）。
+
+模块同时对外暴露内部回放 _replay_debt：它与 debt_simulate 共享同一套
+语义，但在每个事件时刻把**所有**桶（而不仅是链上桶）推进到当前时刻，
+并记录每一步全部桶的扣减后 (balance, debt) 快照——/debt-diff 据此按
+原始索引逐桶对比两个情景。逐步推进全部桶与惰性推进仅在取整时刻的
+采样上等价（min 满足结合律的平移不变性），终态与链上视图完全一致。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from app.models import (
@@ -23,10 +30,12 @@ from app.models import (
     BucketBalance,
     DebtBucketBalance,
     DebtBucketFinalState,
+    DebtBucketSpec,
     DebtRejection,
     DebtSimResult,
     DebtSimulateRequest,
     DebtSimulateResponse,
+    SimRequest,
 )
 from app.simulation import _round
 
@@ -42,10 +51,47 @@ class _BucketState:
         self.last_time = last_time
 
 
-def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
-    buckets = payload.buckets
-    requests = payload.requests
+@dataclass
+class _StepRecord:
+    """一次请求事件的回放记录（供 /debt-simulate 与 /debt-diff 共用）。"""
 
+    index: int
+    request: SimRequest
+    timestamp: float
+    cost: float
+    chain: list[str]
+    # 链上各桶补充还债之后、扣减之前的 (balance, debt)
+    before: dict[str, tuple[float, float]]
+    allowed: bool
+    rejected_by: str | None
+    reason: Literal["cost_exceeds_limit", "debt_limit_exceeded"] | None
+    # 本事件处理之后**所有**桶的 (balance, debt)（链外桶只做时间推进）
+    after_all: dict[str, tuple[float, float]]
+    # 拒绝明细（raw 数值），放行为 None
+    rejection_data: dict | None
+
+
+@dataclass
+class _Replay:
+    """完整回放结果：逐步记录 + 终态与桶参数表。"""
+
+    bucket_ids: list[str]
+    capacity: dict[str, float]
+    refill_rate: dict[str, float]
+    debt_limit: dict[str, float]
+    steps: list[_StepRecord]
+    final: dict[str, tuple[float, float]]
+    t_end: float
+
+
+def _replay_debt(
+    buckets: list[DebtBucketSpec], requests: list[SimRequest]
+) -> _Replay:
+    """按可借贷桶规则回放一条请求序列，返回逐步记录与终态。
+
+    与 debt_simulate 的判定/取整语义完全一致，区别仅在于每个事件时刻
+    把全部桶推进到 now（等价于惰性推进），以便逐桶对比不同情景。
+    """
     capacity = {b.id: float(b.capacity) for b in buckets}
     refill_rate = {b.id: float(b.refill_rate) for b in buckets}
     debt_limit = {b.id: float(b.debt_limit) for b in buckets}
@@ -83,18 +129,21 @@ def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
     # 内部按时间顺序处理；同一时刻按原始输入顺序处理
     order = sorted(range(len(requests)), key=lambda i: (requests[i].timestamp, i))
 
-    results_by_index: dict[int, DebtSimResult] = {}
+    steps: list[_StepRecord] = []
 
     for i in order:
         request = requests[i]
         now = float(request.timestamp)
         cost = float(request.cost)
 
-        # 先对链上所有桶做连续补充（无论最终是否放行，时间都会推进）
-        before: dict[str, tuple[float, float]] = {}
-        for bucket_id in request.chain:
-            state = advance(bucket_id, now)
-            before[bucket_id] = (state.balance, state.debt)
+        # 先对**所有**桶做连续补充（无论是否在链上、无论最终是否放行，
+        # 时间都会推进）；与只推进链上桶的惰性做法得到相同状态。
+        for bucket_id in bucket_ids:
+            advance(bucket_id, now)
+        before: dict[str, tuple[float, float]] = {
+            bucket_id: (states[bucket_id].balance, states[bucket_id].debt)
+            for bucket_id in request.chain
+        }
 
         # 链上第一个无法在借贷上限内满足成本的桶即拒绝桶：
         # cost > capacity + debt_limit 永远不可达；
@@ -119,12 +168,89 @@ def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
                 state.balance -= from_balance
                 state.debt += cost - from_balance
 
+        rejection_data: dict | None = None
+        if rejected_by is not None:
+            bal_before, debt_before = before[rejected_by]
+            remaining_credit = debt_limit[rejected_by] - debt_before
+            available = bal_before + remaining_credit
+            rejection_data = {
+                "bucket_id": rejected_by,
+                "reason": reason,
+                "capacity": capacity[rejected_by],
+                "debt_limit": debt_limit[rejected_by],
+                "cost": cost,
+                "balance_available": bal_before,
+                "debt_before": debt_before,
+                "available": available,
+                "remaining_credit": remaining_credit,
+                "shortage": cost - available,
+            }
+
+        steps.append(
+            _StepRecord(
+                index=i,
+                request=request,
+                timestamp=now,
+                cost=cost,
+                chain=list(request.chain),
+                before=before,
+                allowed=rejected_by is None,
+                rejected_by=rejected_by,
+                reason=reason,
+                after_all={
+                    bucket_id: (states[bucket_id].balance, states[bucket_id].debt)
+                    for bucket_id in bucket_ids
+                },
+                rejection_data=rejection_data,
+            )
+        )
+
+    # 终态：把所有桶补充到最后时刻（全部桶已逐步推进到最后事件时刻，
+    # 此处再幂等推进一次以防 requests 时刻集合为空以外的边界情形）。
+    for bucket_id in bucket_ids:
+        advance(bucket_id, t_end)
+    final = {
+        bucket_id: (states[bucket_id].balance, states[bucket_id].debt)
+        for bucket_id in bucket_ids
+    }
+
+    return _Replay(
+        bucket_ids=bucket_ids,
+        capacity=capacity,
+        refill_rate=refill_rate,
+        debt_limit=debt_limit,
+        steps=steps,
+        final=final,
+        t_end=t_end,
+    )
+
+
+def _build_rejection(data: dict) -> DebtRejection:
+    """把回放中的拒绝明细（raw 数值）转成输出模型（统一取整）。"""
+    return DebtRejection(
+        bucket_id=data["bucket_id"],
+        reason=data["reason"],
+        capacity=_round(data["capacity"]),
+        debt_limit=_round(data["debt_limit"]),
+        cost=_round(data["cost"]),
+        balance_available=_round(data["balance_available"]),
+        debt_before=_round(data["debt_before"]),
+        available=_round(data["available"]),
+        remaining_credit=_round(data["remaining_credit"]),
+        shortage=_round(data["shortage"]),
+    )
+
+
+def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
+    replay = _replay_debt(payload.buckets, payload.requests)
+
+    results_by_index: dict[int, DebtSimResult] = {}
+    for step in replay.steps:
         bucket_views: dict[str, DebtBucketBalance] = {}
-        for bucket_id in request.chain:
-            state = states[bucket_id]
-            bal_before, debt_before = before[bucket_id]
-            if rejected_by is None:
-                bal_after, debt_after = state.balance, state.debt
+        for bucket_id in step.chain:
+            bal_before, debt_before = step.before[bucket_id]
+            if step.allowed:
+                bal_after, debt_after = step.after_all[bucket_id]
             else:
                 # 原子性：拒绝时链上所有桶的余额/债务保持不变
                 bal_after, debt_after = bal_before, debt_before
@@ -137,52 +263,38 @@ def debt_simulate(payload: DebtSimulateRequest) -> DebtSimulateResponse:
                 ),
             )
 
-        rejection: DebtRejection | None = None
-        if rejected_by is not None:
-            bal_before, debt_before = before[rejected_by]
-            remaining_credit = debt_limit[rejected_by] - debt_before
-            available = bal_before + remaining_credit
-            rejection = DebtRejection(
-                bucket_id=rejected_by,
-                reason=reason,
-                capacity=_round(capacity[rejected_by]),
-                debt_limit=_round(debt_limit[rejected_by]),
-                cost=_round(cost),
-                balance_available=_round(bal_before),
-                debt_before=_round(debt_before),
-                available=_round(available),
-                remaining_credit=_round(remaining_credit),
-                shortage=_round(cost - available),
-            )
-
-        results_by_index[i] = DebtSimResult(
-            request_id=request.id,
-            index=i,
-            timestamp=_round(now),
-            cost=_round(cost),
-            allowed=rejected_by is None,
+        results_by_index[step.index] = DebtSimResult(
+            request_id=step.request.id,
+            index=step.index,
+            timestamp=_round(step.timestamp),
+            cost=_round(step.cost),
+            allowed=step.allowed,
             buckets=bucket_views,
-            rejected_by=rejected_by,
-            rejection=rejection,
+            rejected_by=step.rejected_by,
+            rejection=(
+                _build_rejection(step.rejection_data)
+                if step.rejection_data is not None
+                else None
+            ),
         )
 
-    results = [results_by_index[i] for i in range(len(requests))]
+    results = [results_by_index[i] for i in range(len(payload.requests))]
     allowed_count = sum(1 for r in results if r.allowed)
 
-    # 把所有未再参与请求的桶补充到最后时刻，给出终态快照
+    # 终态快照（所有桶推进到最后一个时间戳后）
     final_buckets: list[DebtBucketFinalState] = []
-    for bucket_id in bucket_ids:
-        state = advance(bucket_id, t_end)
+    for bucket_id in replay.bucket_ids:
+        balance, debt = replay.final[bucket_id]
         final_buckets.append(
             DebtBucketFinalState(
                 id=bucket_id,
-                capacity=_round(capacity[bucket_id]),
-                refill_rate=_round(refill_rate[bucket_id]),
-                debt_limit=_round(debt_limit[bucket_id]),
-                balance=_round(state.balance),
-                debt=_round(state.debt),
+                capacity=_round(replay.capacity[bucket_id]),
+                refill_rate=_round(replay.refill_rate[bucket_id]),
+                debt_limit=_round(replay.debt_limit[bucket_id]),
+                balance=_round(balance),
+                debt=_round(debt),
                 available=_round(
-                    state.balance + (debt_limit[bucket_id] - state.debt)
+                    balance + (replay.debt_limit[bucket_id] - debt)
                 ),
             )
         )
